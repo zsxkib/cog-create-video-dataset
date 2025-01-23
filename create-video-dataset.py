@@ -83,28 +83,63 @@ class Predictor(BasePredictor):
         return safe_name
 
     def download_video(self, url: str, output_dir: str) -> str:
-        """Download video and return sanitized filename"""
+        """Download video from URL"""
         ydl_opts = {
-            "format": "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",  # Prefer MP4 format
-            "merge_output_format": "mp4",  # Ensure final output is MP4
+            # Get best quality available but prefer h264 codec for compatibility
+            "format": "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/best[ext=mp4]/best",
+            # Use MP4 container
+            "merge_output_format": "mp4",
+            # Keep original quality when possible
+            "postprocessor_args": ["-c:v", "copy", "-c:a", "copy"],
+            # Quality verification logging
+            "quiet": False,
+            "no_warnings": False,
+            "verbose": True,
+            # Ensure we get .mp4 extension
             "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
             "progress_hooks": [self._download_progress_hook],
         }
 
         with YoutubeDL(ydl_opts) as ydl:
+            # Get video info first
+            print("\n📊 Available Video Formats:")
+            info = ydl.extract_info(url, download=False)
+
+            # Print all available formats
+            if "formats" in info:
+                print("\nAvailable formats:")
+                for f in info["formats"]:
+                    if "height" in f and "ext" in f:
+                        print(
+                            f"Format {f['format_id']}: {f['ext']} - {f.get('height', 'N/A')}p"
+                        )
+
+            # Now download best quality
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
 
-            # Get the original downloaded file path
-            original_path = os.path.join(output_dir, filename)
+            # Print selected format details
+            print(f"\n📊 Selected Format:")
+            if "resolution" in info:
+                print(f"Resolution: {info['resolution']}")
+            if "fps" in info:
+                print(f"FPS: {info['fps']}")
+            if "vcodec" in info:
+                print(f"Video Codec: {info['vcodec']}")
+            if "acodec" in info:
+                print(f"Audio Codec: {info['acodec']}")
+
+            # Ensure we have the correct extension
+            if not filename.endswith(".mp4"):
+                filename = os.path.splitext(filename)[0] + ".mp4"
 
             # Create sanitized filename
-            sanitized_name = f"{self.sanitize_filename(filename)}.mp4"
+            sanitized_name = f"{self.sanitize_filename(os.path.splitext(os.path.basename(filename))[0])}.mp4"
             new_path = os.path.join(output_dir, sanitized_name)
 
-            # Rename the file
-            if original_path != new_path:
-                shutil.move(original_path, new_path)
+            # Move file if needed
+            if os.path.exists(filename) and filename != new_path:
+                shutil.move(filename, new_path)
                 print(f"\n📝 Renamed file to: {sanitized_name}")
 
             return sanitized_name
@@ -332,6 +367,7 @@ class Predictor(BasePredictor):
                 "-print_format",
                 "json",
                 "-show_format",
+                "-show_streams",
                 input_path,
             ],
             capture_output=True,
@@ -339,6 +375,15 @@ class Predictor(BasePredictor):
         )
         video_info = json.loads(probe.stdout)
         total_duration = float(video_info["format"]["duration"])
+
+        # Print quality info for verification
+        for stream in video_info.get("streams", []):
+            if stream.get("codec_type") == "video":
+                print(f"\n📊 Input Video Quality:")
+                print(f"   Codec: {stream.get('codec_name')}")
+                print(f"   Resolution: {stream.get('width')}x{stream.get('height')}")
+                print(f"   Bitrate: {int(stream.get('bit_rate', 0))/1000000:.2f} Mbps")
+                break
 
         # Validate start_time and duration
         if start_time < 0:
@@ -365,28 +410,154 @@ class Predictor(BasePredictor):
             segment_start = start_time + (i * segment_duration)
             output_path = f"{os.path.dirname(input_path)}/{base_name}_seg{i+1:02d}.mp4"
 
-            # Use ffmpeg to extract segment
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-ss",
-                    str(segment_start),  # Seek before input
-                    "-i",
-                    input_path,
-                    "-t",
-                    str(segment_duration),
-                    "-c",
-                    "copy",  # Copy codecs for faster processing
-                    output_path,
-                ],
-                capture_output=True,
-            )
+            # Enhanced ffmpeg command with better error handling
+            try:
+                # First, try with seeking before input
+                result = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",  # Overwrite output
+                        "-ss",
+                        str(segment_start),
+                        "-i",
+                        input_path,
+                        "-t",
+                        str(segment_duration),
+                        "-c:v",
+                        "copy",  # Copy video codec
+                        "-c:a",
+                        "copy",  # Copy audio codec
+                        "-avoid_negative_ts",
+                        "1",
+                        output_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,  # Raise exception on error
+                )
 
-            output_files.append(output_path)
-            print(
-                f"  ✓ Created segment {i+1}/{num_segments} ({segment_start:.1f}s to {segment_start + segment_duration:.1f}s)"
-            )
+                # Verify the output file exists and has non-zero size
+                if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                    raise subprocess.CalledProcessError(
+                        1, "ffmpeg", "Output file is empty"
+                    )
+
+                # Verify segment has video stream
+                verify = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "quiet",
+                        "-print_format",
+                        "json",
+                        "-show_streams",
+                        output_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+                segment_info = json.loads(verify.stdout)
+                has_video = False
+                for stream in segment_info.get("streams", []):
+                    if stream.get("codec_type") == "video":
+                        has_video = True
+                        print(f"\n✓ Segment {i+1} Quality:")
+                        print(f"   Codec: {stream.get('codec_name')}")
+                        print(
+                            f"   Resolution: {stream.get('width')}x{stream.get('height')}"
+                        )
+                        print(
+                            f"   Bitrate: {int(stream.get('bit_rate', 0))/1000000:.2f} Mbps"
+                        )
+                        break
+
+                if not has_video:
+                    raise ValueError("No video stream found in output")
+
+                output_files.append(output_path)
+                print(
+                    f"  ✓ Created segment {i+1}/{num_segments} ({segment_start:.1f}s to {segment_start + segment_duration:.1f}s)"
+                )
+
+            except (subprocess.CalledProcessError, ValueError) as e:
+                print(f"\n⚠️ Error creating segment {i+1}: {str(e)}")
+                # Try alternative ffmpeg approach with seeking after input
+                try:
+                    result = subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            input_path,
+                            "-ss",
+                            str(segment_start),
+                            "-t",
+                            str(segment_duration),
+                            "-c:v",
+                            "copy",
+                            "-c:a",
+                            "copy",
+                            "-avoid_negative_ts",
+                            "1",
+                            output_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+
+                    # Verify output again
+                    if (
+                        not os.path.exists(output_path)
+                        or os.path.getsize(output_path) == 0
+                    ):
+                        raise subprocess.CalledProcessError(
+                            1, "ffmpeg", "Output file is empty"
+                        )
+
+                    verify = subprocess.run(
+                        [
+                            "ffprobe",
+                            "-v",
+                            "quiet",
+                            "-print_format",
+                            "json",
+                            "-show_streams",
+                            output_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+
+                    segment_info = json.loads(verify.stdout)
+                    has_video = False
+                    for stream in segment_info.get("streams", []):
+                        if stream.get("codec_type") == "video":
+                            has_video = True
+                            break
+
+                    if not has_video:
+                        raise ValueError("No video stream found in output")
+
+                    output_files.append(output_path)
+                    print(
+                        f"  ✓ Created segment {i+1}/{num_segments} (alternative method)"
+                    )
+
+                except (subprocess.CalledProcessError, ValueError) as e2:
+                    print(
+                        f"  ❌ Failed to create segment {i+1} (alternative method): {str(e2)}"
+                    )
+                    # Remove failed output file if it exists
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    continue
+
+        if not output_files:
+            raise RuntimeError("Failed to create any valid video segments")
 
         return output_files
 
@@ -399,6 +570,10 @@ class Predictor(BasePredictor):
         video_file: Path = Input(
             description="Video file to process. Leave empty if using URL. Ignored if URL is provided.",
             default=None,
+        ),
+        target_fps: float = Input(
+            description="Target frame rate (e.g. 24, 30). Set to -1 to keep original fps. Default: 24",
+            default=24.0,
         ),
         start_time: float = Input(
             description="Start time in seconds for video processing",
@@ -456,107 +631,151 @@ class Predictor(BasePredictor):
         videos_dir = os.path.join(temp_dir, "videos")
         os.makedirs(videos_dir, exist_ok=True)
 
-        try:
-            # Handle video input
-            if video_url:
-                print(f"\n📥 Downloading video from: {video_url}")
-                filename = self.download_video(video_url, videos_dir)
-                video_path = os.path.join(videos_dir, filename)
-            else:
-                print(f"\n📥 Processing uploaded video: {video_file.name}")
-                sanitized_name = f"{self.sanitize_filename(video_file.name)}.mp4"
-                video_path = os.path.join(videos_dir, sanitized_name)
-                shutil.copy(str(video_file), video_path)
-                filename = sanitized_name
+        # Handle video input
+        if video_url:
+            print(f"\n📥 Downloading video from: {video_url}")
+            filename = self.download_video(video_url, videos_dir)
+            video_path = os.path.join(videos_dir, filename)
+        else:
+            print(f"\n📥 Processing uploaded video: {video_file.name}")
+            sanitized_name = f"{self.sanitize_filename(video_file.name)}.mp4"
+            video_path = os.path.join(videos_dir, sanitized_name)
+            shutil.copy(str(video_file), video_path)
+            filename = sanitized_name
 
-            # Calculate effective duration
-            if end_time is not None:
-                if end_time <= start_time:
-                    raise ValueError("end_time must be greater than start_time")
-                effective_duration = end_time - start_time
-            else:
-                effective_duration = duration
-
-            # Split video into segments
-            segment_paths = self.split_video(
-                video_path,
-                start_time=start_time,
-                duration=effective_duration,
-                num_segments=num_segments,
+        # Apply fps conversion if needed
+        if target_fps > 0:
+            print(f"\n🎥 Converting frame rate to {target_fps} fps...")
+            temp_path = video_path + ".temp.mp4"
+            
+            # Get original fps
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                    "-show_entries", "stream=r_frame_rate", "-of",
+                    "default=noprint_wrappers=1:nokey=1", video_path],
+                capture_output=True, text=True, check=True
             )
+            num, den = map(int, probe.stdout.strip().split('/'))
+            original_fps = num / den
+            print(f"Original fps: {original_fps:.2f}")
+            
+            # Convert fps while maintaining quality
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", video_path, "-vf", f"fps={target_fps}",
+                    "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+                    "-c:a", "copy", temp_path],
+                capture_output=True, text=True, check=True
+            )
+            
+            # Verify the conversion
+            verify = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height,r_frame_rate",
+                    "-of", "json", temp_path],
+                capture_output=True, text=True, check=True
+            )
+            
+            info = json.loads(verify.stdout)
+            for stream in info.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    print(f"\n✓ Converted Video Quality:")
+                    print(f"   Resolution: {stream.get('width')}x{stream.get('height')}")
+                    fps_str = stream.get('r_frame_rate', '0/1')
+                    num, den = map(int, fps_str.split('/'))
+                    print(f"   Frame Rate: {num/den:.2f} fps")
+                    break
+            
+            os.replace(temp_path, video_path)
+            print(f"✅ Successfully converted frame rate")
 
-            # Process each segment
-            for i, segment_path in enumerate(segment_paths, 1):
-                base_name = os.path.splitext(os.path.basename(segment_path))[0]
-                caption_path = os.path.join(videos_dir, f"{base_name}.txt")
+        # Calculate effective duration
+        if end_time is not None:
+            if end_time <= start_time:
+                raise ValueError("end_time must be greater than start_time")
+            effective_duration = end_time - start_time
+        else:
+            effective_duration = duration
 
-                # Build caption components
-                prefix = f"{autocaption_prefix.strip()} " if autocaption_prefix else ""
-                suffix = f" {autocaption_suffix.strip()}" if autocaption_suffix else ""
-                trigger = f"{trigger_word.strip()} " if trigger_word else ""
+        # Split video into segments
+        segment_paths = self.split_video(
+            video_path,
+            start_time=start_time,
+            duration=effective_duration,
+            num_segments=num_segments,
+        )
 
-                print(f"\n🎬 Processing segment {i}/{len(segment_paths)}")
+        # Process each segment
+        for i, segment_path in enumerate(segment_paths, 1):
+            base_name = os.path.splitext(os.path.basename(segment_path))[0]
+            caption_path = os.path.join(videos_dir, f"{base_name}.txt")
 
-                if not autocaption and custom_caption is None:
-                    raise ValueError(
-                        "When autocaption=False, you must provide a custom_caption"
-                    )
+            # Build caption components
+            prefix = f"{autocaption_prefix.strip()} " if autocaption_prefix else ""
+            suffix = f" {autocaption_suffix.strip()}" if autocaption_suffix else ""
+            trigger = f"{trigger_word.strip()} " if trigger_word else ""
 
-                if not autocaption:
-                    print("✍️ Using your custom caption")
-                    final_caption = f"{prefix}{trigger}{custom_caption.strip()} (part {i}/{len(segment_paths)}){suffix}"
-                else:
-                    print("🤖 Generating caption using AI...")
-                    final_caption = self.generate_caption(
-                        segment_path,
-                        prompt=caption_prompt,
-                        trigger_word=trigger_word,
-                        prefix=autocaption_prefix,
-                        suffix=autocaption_suffix,
-                    )
+            print(f"\n🎬 Processing segment {i}/{len(segment_paths)}")
 
-                # Save caption
-                with open(caption_path, "w", encoding="utf-8") as f:
-                    f.write(final_caption.strip() + "\n")
-
-                print(f"\n📝 Caption for segment {i}:")
-                print("--------------------")
-                print(final_caption)
-                print("--------------------")
-
-            # Create zip file with timestamp
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = f"processed_videos_{timestamp}.zip"
-
-            with ZipFile(output_path, "w") as zipf:
-                print(f"\n📦 Creating zip file...")
-                for segment_path in segment_paths:
-                    base_name = os.path.splitext(os.path.basename(segment_path))[0]
-                    zipf.write(segment_path, f"videos/{os.path.basename(segment_path)}")
-                    caption_path = os.path.join(videos_dir, f"{base_name}.txt")
-                    zipf.write(caption_path, f"videos/{base_name}.txt")
-
-            # Show zip contents
-            with ZipFile(output_path, "r") as zipf:
-                zip_info = zipf.infolist()
-
-            print("\n📋 Zip contents:")
-            print("--------------------")
-            print(f"{'Size':>10}  {'Name'}")
-            print(f"{'----':>10}  {'----'}")
-            for info in zip_info:
-                size_str = (
-                    f"{info.file_size/1024/1024:.1f}M"
-                    if info.file_size > 1024 * 1024
-                    else f"{info.file_size/1024:.1f}K"
+            if not autocaption and custom_caption is None:
+                raise ValueError(
+                    "When autocaption=False, you must provide a custom_caption"
                 )
-                print(f"{size_str:>10}  {info.filename}")
+
+            if not autocaption:
+                print("✍️ Using your custom caption")
+                final_caption = f"{prefix}{trigger}{custom_caption.strip()} (part {i}/{len(segment_paths)}){suffix}"
+            else:
+                print("🤖 Generating caption using AI...")
+                final_caption = self.generate_caption(
+                    segment_path,
+                    prompt=caption_prompt,
+                    trigger_word=trigger_word,
+                    prefix=autocaption_prefix,
+                    suffix=autocaption_suffix,
+                )
+
+            # Save caption
+            with open(caption_path, "w", encoding="utf-8") as f:
+                f.write(final_caption.strip() + "\n")
+
+            print(f"\n📝 Caption for segment {i}:")
+            print("--------------------")
+            print(final_caption)
             print("--------------------")
 
-            print(f"\n✨ Success! Output saved to: {output_path}")
-            return Path(output_path)
+        # Create zip file with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"processed_videos_{timestamp}.zip"
 
-        finally:
-            # Cleanup
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+        with ZipFile(output_path, "w") as zipf:
+            print(f"\n📦 Creating zip file...")
+            for segment_path in segment_paths:
+                base_name = os.path.splitext(os.path.basename(segment_path))[0]
+                zipf.write(segment_path, f"videos/{os.path.basename(segment_path)}")
+                caption_path = os.path.join(videos_dir, f"{base_name}.txt")
+                zipf.write(caption_path, f"videos/{base_name}.txt")
+
+        # Show zip contents
+        with ZipFile(output_path, "r") as zipf:
+            zip_info = zipf.infolist()
+
+        print("\n📋 Zip contents:")
+        print("--------------------")
+        print(f"{'Size':>10}  {'Name'}")
+        print(f"{'----':>10}  {'----'}")
+        for info in zip_info:
+            size_str = (
+                f"{info.file_size/1024/1024:.1f}M"
+                if info.file_size > 1024 * 1024
+                else f"{info.file_size/1024:.1f}K"
+            )
+            print(f"{size_str:>10}  {info.filename}")
+        print("--------------------")
+
+        print(f"\n✨ Success! Output saved to: {output_path}")
+        # Cleanup
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            
+        return Path(output_path)
+
