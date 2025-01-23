@@ -1,0 +1,21 @@
+# Configuration for Cog ⚙️
+# Reference: https://cog.run/yaml
+
+build:
+  gpu: true
+  python_version: "3.11"
+  system_packages:
+    - "ffmpeg"
+  python_packages:
+    - "torch==2.1.2"
+    - "transformers"
+    - "accelerate"
+    - "numpy<2"
+    - "qwen-vl-utils"
+    - "yt-dlp"
+
+  run:
+    - FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE pip install flash-attn --no-build-isolation
+    - curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/download/v0.8.2/pget_linux_x86_64" && chmod +x /usr/local/bin/pget
+
+predict: "create-video-dataset.py:Predictor"
