@@ -13,6 +13,10 @@ build:
     - "numpy<2"
     - "qwen-vl-utils"
     - "yt-dlp"
+    - "opencv-python-headless"
+    - "pillow"
+    - "scenedetect[opencv]>=0.6.1"
+    - "concurrent-log-handler"
 
   run:
     - FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE pip install flash-attn --no-build-isolation
