@@ -171,5 +171,7 @@ cython_debug/
 .pypirc
 
 # Replicate
+/qwen_checkpoints
+/video_processing
 *.zip
-qwen_checkpoints
+*.mp4

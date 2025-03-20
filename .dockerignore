@@ -21,3 +21,4 @@ __pycache__
 qwen_checkpoints
 *.zip
 *.mp4
+video_processing/
