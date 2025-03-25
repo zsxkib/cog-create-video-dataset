@@ -39,37 +39,33 @@ QWEN_MODEL_URL = (
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        """Load the QWEN model for auto-captioning and verify ffmpeg"""
-        # Verify ffmpeg is available
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-
-        # Download and setup QWEN model
-        if not os.path.exists(QWEN_MODEL_CACHE):
-            print(f"Downloading Qwen2-VL model to {QWEN_MODEL_CACHE}")
-            subprocess.run(["pget", "-xf", QWEN_MODEL_URL, QWEN_MODEL_CACHE], check=False)
-
-        try:
-            from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-
-            print("\nLoading QWEN model...")
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                QWEN_MODEL_CACHE,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
-                device_map="auto",
-            )
-            self.processor = AutoProcessor.from_pretrained(QWEN_MODEL_CACHE)
-            print("✅ QWEN model loaded successfully")
-        except Exception as e:
-            print(f"⚠️ Error loading QWEN model: {str(e)}")
-            print("Will continue with limited functionality (no auto-captioning)")
-            self.model = None
-            self.processor = None
-
-        # Create output directories in the current working directory
+        """Load the QWEN model for auto-captioning"""
+        # Create output directories
         self.temp_dir = "video_processing"
         self.videos_dir = os.path.join(self.temp_dir, "videos")
         os.makedirs(self.videos_dir, exist_ok=True)
+
+        # Download QWEN model if needed
+        if not os.path.exists(QWEN_MODEL_CACHE):
+            print(f"Downloading Qwen2-VL model to {QWEN_MODEL_CACHE}")
+            subprocess.run(["pget", "-xf", QWEN_MODEL_URL, QWEN_MODEL_CACHE])
+
+        # Import and load model
+        try:
+            from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+            
+            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                QWEN_MODEL_CACHE,
+                torch_dtype=torch.bfloat16,
+                # attn_implementation="flash_attention_2",
+                device_map="auto",
+            )
+            self.processor = AutoProcessor.from_pretrained(QWEN_MODEL_CACHE)
+            print("✅ QWEN model loaded for auto-captioning")
+        except Exception as e:
+            print(f"⚠️ Auto-captioning disabled: {str(e)}")
+            self.model = None
+            self.processor = None
 
     def sanitize_filename(self, filename: str) -> str:
         """Convert filename to a safe version without spaces or special characters"""
@@ -194,92 +190,40 @@ class Predictor(BasePredictor):
         if threshold is not None:
             print(f"Using threshold value: {threshold}")
         
-        try:
-            # Open video using the modern API
-            video = open_video(video_path)
-            stats_manager = StatsManager()
-            scene_manager = SceneManager(stats_manager)
-            
-            # Add the appropriate detector
-            if detection_mode == "adaptive":
-                # AdaptiveDetector handles camera movement better
-                detector_threshold = threshold if threshold is not None else 3.0
-                detector = AdaptiveDetector(min_scene_len=min_scene_length, threshold=detector_threshold)
-            elif detection_mode == "threshold":
-                # ThresholdDetector is best for fade in/out transitions
-                detector_threshold = threshold if threshold is not None else 12.0
-                detector = ThresholdDetector(threshold=detector_threshold, min_scene_len=min_scene_length)
-            else:
-                # ContentDetector is best for most fast-cut content and is default
-                detector_threshold = threshold if threshold is not None else 27.0
-                detector = ContentDetector(threshold=detector_threshold, min_scene_len=min_scene_length)
-            
-            scene_manager.add_detector(detector)
-            
-            # Set time range if specified
-            kwargs = {}
-            if start_time > 0:
-                kwargs["start_time"] = start_time
-                if end_time > start_time:
-                    kwargs["end_time"] = end_time
-            
-            # Detect scenes with proper error handling
-            try:
-                scene_manager.detect_scenes(video, show_progress=True, **kwargs)
-                scene_list = scene_manager.get_scene_list()
-            except TypeError as e:
-                # Handle specific TypeError related to frame_buffer slicing
-                if "slice indices must be integers" in str(e):
-                    print(f"⚠️ Error with PySceneDetect internal frame buffering: {str(e)}")
-                    print("Trying alternative detection approach...")
-                    
-                    # Try with a different frame buffer size
-                    scene_manager._frame_buffer = []  # Reset buffer
-                    scene_manager._frame_buffer_size = 0  # Disable frame buffer
-                    
-                    # Manually process frames to avoid the bug
-                    cap = cv2.VideoCapture(video_path)
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    
-                    # Calculate frame positions
-                    start_frame = max(0, int(start_time * fps)) if start_time > 0 else 0
-                    end_frame = min(total_frames, int(end_time * fps)) if end_time > start_time else total_frames
-                    
-                    # Create empty scene list
-                    from scenedetect.frame_timecode import FrameTimecode
-                    
-                    # Create scene list with a single scene spanning the entire video
-                    try:
-                        start_tc = FrameTimecode(start_frame, fps)
-                        end_tc = FrameTimecode(end_frame, fps)
-                        scene_list = [(start_tc, end_tc)]
-                    except:
-                        # Fallback using our custom FakeTimecode
-                        class FakeTimecode:
-                            def __init__(self, frame_num, seconds, fps):
-                                self.frame_num = frame_num
-                                self.seconds = seconds
-                                self.fps = fps
-                            
-                            def get_frames(self):
-                                return self.frame_num
-                                
-                            def get_seconds(self):
-                                return self.seconds
-                        
-                        start_tc = FakeTimecode(start_frame, start_frame/fps, fps)
-                        end_tc = FakeTimecode(end_frame, end_frame/fps, fps)
-                        scene_list = [(start_tc, end_tc)]
-                
-                cap.release()
-            
-            print(f"✅ Detected {len(scene_list)} scenes")
-            return scene_list
-            
-        except Exception as e:
-            print(f"⚠️ Error in scene detection: {str(e)}")
-            raise e
+        # Open video using the modern API
+        video = open_video(video_path)
+        stats_manager = StatsManager()
+        scene_manager = SceneManager(stats_manager)
+        
+        # Add the appropriate detector
+        if detection_mode == "adaptive":
+            # AdaptiveDetector handles camera movement better
+            detector_threshold = threshold if threshold is not None else 3.0
+            detector = AdaptiveDetector(min_scene_len=min_scene_length, threshold=detector_threshold)
+        elif detection_mode == "threshold":
+            # ThresholdDetector is best for fade in/out transitions
+            detector_threshold = threshold if threshold is not None else 12.0
+            detector = ThresholdDetector(threshold=detector_threshold, min_scene_len=min_scene_length)
+        else:
+            # ContentDetector is best for most fast-cut content and is default
+            detector_threshold = threshold if threshold is not None else 27.0
+            detector = ContentDetector(threshold=detector_threshold, min_scene_len=min_scene_length)
+        
+        scene_manager.add_detector(detector)
+        
+        # Set time range if specified
+        kwargs = {}
+        if start_time > 0:
+            kwargs["start_time"] = start_time
+            if end_time > start_time:
+                kwargs["end_time"] = end_time
+        
+        # Detect scenes
+        scene_manager.detect_scenes(video, show_progress=True, **kwargs)
+        scene_list = scene_manager.get_scene_list()
+        
+        print(f"✅ Detected {len(scene_list)} scenes")
+        return scene_list
 
     def evaluate_scene_quality(self, video_path: str, scene_list: List, num_scenes: int) -> List:
         """
@@ -391,233 +335,87 @@ class Predictor(BasePredictor):
         preview_dir = os.path.join(output_dir, "preview_images")
         os.makedirs(preview_dir, exist_ok=True)
         
-        # Extract frames directly using OpenCV if scene_list is empty or if save_images fails
+        # Skip if no scenes detected
         if not scene_list:
-            return self._generate_fallback_preview(video_path, output_dir)
-        
-        try:
-            # Extract center frame from each scene
-            video = open_video(video_path)
-            print(f"Saving 1 image per scene [format=jpg] to {preview_dir}")
-            
-            # Extract frame images
-            try:
-                image_filenames = save_images(
-                    scene_list, 
-                    video,
-                    num_images=1,  # One image per scene
-                    image_name_template='scene_{:03d}',  # Simple numbered format
-                    output_dir=preview_dir
-                )
-            except Exception as e:
-                print(f"⚠️ Error saving scene images: {str(e)}")
-                return self._generate_fallback_preview(video_path, output_dir, scene_list)
-            
-            # Find image files in directory (fallback if save_images returns unexpected format)
-            actual_files = os.listdir(preview_dir)
-            image_paths = []
-            
-            if not actual_files:
-                print("❌ No preview images could be generated")
-                return self._generate_fallback_preview(video_path, output_dir, scene_list)
-                
-            # Find all images in the directory
-            for filename in sorted(actual_files):
-                if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    img_path = os.path.join(preview_dir, filename)
-                    try:
-                        img = Image.open(img_path)
-                        img = img.resize((320, 180))  # Resize for grid
-                        image_paths.append((img_path, img))
-                    except:
-                        # Skip invalid images
-                        continue
-            
-            # Check if we have any valid images
-            if not image_paths:
-                print("❌ No valid preview images could be loaded")
-                return self._generate_fallback_preview(video_path, output_dir, scene_list)
-            
-            # Calculate grid dimensions
-            num_images = len(image_paths)
-            grid_cols = min(5, num_images)
-            grid_rows = math.ceil(num_images / grid_cols)
-            
-            # Create empty grid
-            cell_width, cell_height = 320, 220  # Image height + space for text
-            grid_width = cell_width * grid_cols
-            grid_height = cell_height * grid_rows
-            
-            grid_image = Image.new('RGB', (grid_width, grid_height), color=(20, 20, 20))
-            draw = ImageDraw.Draw(grid_image)
-            
-            # Use default font
-            font = ImageFont.load_default()
-            
-            # Place images and metadata on grid
-            for i, (_, img) in enumerate(image_paths[:len(scene_list)]):
-                scene = scene_list[i]
-                row = i // grid_cols
-                col = i % grid_cols
-                
-                # Calculate position
-                x = col * cell_width
-                y = row * cell_height
-                
-                # Paste image
-                grid_image.paste(img, (x, y))
-                
-                # Add scene info
-                start_time = scene[0].get_seconds()
-                end_time = scene[1].get_seconds()
-                duration = end_time - start_time
-                
-                draw.text(
-                    (x + 5, y + 185),
-                    f"Scene {i+1}: {start_time:.1f}s - {end_time:.1f}s ({duration:.1f}s)",
-                    fill=(255, 255, 255),
-                    font=font
-                )
-            
-            # Save grid image
-            preview_path = os.path.join(output_dir, "scene_preview.jpg")
-            grid_image.save(preview_path, quality=95)
-            
-            print(f"✅ Preview image saved to: {preview_path}")
-            print(f"   Individual frame images saved in: {preview_dir}")
-            return Path(preview_path)
-            
-        except Exception as e:
-            print(f"⚠️ Error generating preview: {str(e)}")
-            return self._generate_fallback_preview(video_path, output_dir, scene_list)
-            
-    def _generate_fallback_preview(self, video_path, output_dir, scene_list=None):
-        """Generate a basic preview when the normal method fails"""
-        preview_dir = os.path.join(output_dir, "preview_images")
-        os.makedirs(preview_dir, exist_ok=True)
-        
-        print("📷 Generating fallback preview...")
-        
-        try:
-            # Open the video
-            cap = cv2.VideoCapture(video_path)
-            
-            if not cap.isOpened():
-                print("❌ Could not open video file")
-                preview_path = os.path.join(output_dir, "scene_preview_failed.txt")
-                with open(preview_path, "w") as f:
-                    f.write("Failed to generate preview images\n")
-                return Path(preview_path)
-            
-            # Get video properties
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            duration = frame_count / fps
-            
-            # Extract frames
-            image_paths = []
-            
-            if scene_list:
-                # Use scene list to extract frames
-                for i, scene in enumerate(scene_list):
-                    # Get middle frame of scene
-                    start_frame = scene[0].get_frames()
-                    end_frame = scene[1].get_frames()
-                    middle_frame = start_frame + (end_frame - start_frame) // 2
-                    
-                    # Set position and read frame
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
-                    ret, frame = cap.read()
-                    
-                    if ret:
-                        # Save frame
-                        img_path = os.path.join(preview_dir, f"scene_{i+1:03d}.jpg")
-                        cv2.imwrite(img_path, frame)
-                        
-                        # Convert BGR to RGB for PIL
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        img = Image.fromarray(frame_rgb)
-                        img = img.resize((320, 180))
-                        
-                        image_paths.append((img_path, img))
-            else:
-                # Extract evenly spaced frames
-                num_frames = min(4, int(frame_count))
-                frame_positions = [int(i * frame_count / num_frames) for i in range(num_frames)]
-                
-                for i, pos in enumerate(frame_positions):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-                    ret, frame = cap.read()
-                    
-                    if ret:
-                        # Save frame
-                        img_path = os.path.join(preview_dir, f"scene_{i+1:03d}.jpg")
-                        cv2.imwrite(img_path, frame)
-                        
-                        # Convert BGR to RGB for PIL
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        img = Image.fromarray(frame_rgb)
-                        img = img.resize((320, 180))
-                        
-                        image_paths.append((img_path, img))
-            
-            cap.release()
-            
-            # Generate grid with images
-            if image_paths:
-                # Calculate grid dimensions
-                num_images = len(image_paths)
-                grid_cols = min(5, num_images)
-                grid_rows = math.ceil(num_images / grid_cols)
-                
-                # Create empty grid
-                cell_width, cell_height = 320, 220
-                grid_width = cell_width * grid_cols
-                grid_height = cell_height * grid_rows
-                
-                grid_image = Image.new('RGB', (grid_width, grid_height), color=(20, 20, 20))
-                draw = ImageDraw.Draw(grid_image)
-                
-                # Place images on grid
-                for i, (_, img) in enumerate(image_paths):
-                    row = i // grid_cols
-                    col = i % grid_cols
-                    
-                    # Calculate position
-                    x = col * cell_width
-                    y = row * cell_height
-                    
-                    # Paste image
-                    grid_image.paste(img, (x, y))
-                    
-                    # Add text
-                    time_pos = (i * duration) / num_images
-                    draw.text(
-                        (x + 5, y + 185),
-                        f"Frame {i+1}: {time_pos:.1f}s",
-                        fill=(255, 255, 255),
-                        font=ImageFont.load_default()
-                    )
-                
-                # Save grid image
-                preview_path = os.path.join(output_dir, "scene_preview.jpg")
-                grid_image.save(preview_path, quality=95)
-                
-                print(f"✅ Fallback preview image saved to: {preview_path}")
-                return Path(preview_path)
-            else:
-                print("❌ Could not extract any frames")
-                preview_path = os.path.join(output_dir, "scene_preview_failed.txt")
-                with open(preview_path, "w") as f:
-                    f.write("Failed to extract any frames for preview\n")
-                return Path(preview_path)
-                
-        except Exception as e:
-            print(f"❌ Error in fallback preview: {str(e)}")
-            preview_path = os.path.join(output_dir, "scene_preview_failed.txt")
+            print("❌ No scenes to preview")
+            preview_path = os.path.join(output_dir, "scene_preview_empty.txt")
             with open(preview_path, "w") as f:
-                f.write(f"Failed to generate preview images: {str(e)}\n")
+                f.write("No scenes detected to preview\n")
             return Path(preview_path)
+        
+        # Extract center frame from each scene
+        video = open_video(video_path)
+        print(f"Saving 1 image per scene [format=jpg] to {preview_dir}")
+        
+        # Extract frame images
+        image_filenames = save_images(
+            scene_list, 
+            video,
+            num_images=1,  # One image per scene
+            image_name_template='scene_{:03d}',  # Simple numbered format
+            output_dir=preview_dir
+        )
+        
+        # Find image files in directory
+        actual_files = os.listdir(preview_dir)
+        image_paths = []
+        
+        # Find all images in the directory
+        for filename in sorted(actual_files):
+            if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+                img_path = os.path.join(preview_dir, filename)
+                img = Image.open(img_path)
+                img = img.resize((320, 180))  # Resize for grid
+                image_paths.append((img_path, img))
+        
+        # Calculate grid dimensions
+        num_images = len(image_paths)
+        grid_cols = min(5, num_images)
+        grid_rows = math.ceil(num_images / grid_cols)
+        
+        # Create empty grid
+        cell_width, cell_height = 320, 220  # Image height + space for text
+        grid_width = cell_width * grid_cols
+        grid_height = cell_height * grid_rows
+        
+        grid_image = Image.new('RGB', (grid_width, grid_height), color=(20, 20, 20))
+        draw = ImageDraw.Draw(grid_image)
+        
+        # Use default font
+        font = ImageFont.load_default()
+        
+        # Place images and metadata on grid
+        for i, (_, img) in enumerate(image_paths[:len(scene_list)]):
+            scene = scene_list[i]
+            row = i // grid_cols
+            col = i % grid_cols
+            
+            # Calculate position
+            x = col * cell_width
+            y = row * cell_height
+            
+            # Paste image
+            grid_image.paste(img, (x, y))
+            
+            # Add scene info
+            start_time = scene[0].get_seconds()
+            end_time = scene[1].get_seconds()
+            duration = end_time - start_time
+            
+            draw.text(
+                (x + 5, y + 185),
+                f"Scene {i+1}: {start_time:.1f}s - {end_time:.1f}s ({duration:.1f}s)",
+                fill=(255, 255, 255),
+                font=font
+            )
+        
+        # Save grid image
+        preview_path = os.path.join(output_dir, "scene_preview.jpg")
+        grid_image.save(preview_path, quality=95)
+        
+        print(f"✅ Preview image saved to: {preview_path}")
+        print(f"   Individual frame images saved in: {preview_dir}")
+        return Path(preview_path)
 
     def autocaption_videos(
         self,
@@ -752,66 +550,61 @@ class Predictor(BasePredictor):
         if self.model is None or self.processor is None:
             return fallback_caption
         
-        try:
-            # Prepare messages format with custom prompt
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "video",
-                            "video": os.path.abspath(video_path),
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-                    ],
-                }
-            ]
+        # Prepare messages format with custom prompt
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": os.path.abspath(video_path),
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ]
 
-            # Process inputs
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+        # Process inputs
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
 
-            # Import vision utility
-            from qwen_vl_utils import process_vision_info
-            image_inputs, video_inputs = process_vision_info(messages)
+        # Import vision utility
+        from qwen_vl_utils import process_vision_info
+        image_inputs, video_inputs = process_vision_info(messages)
 
-            # Prepare model inputs
-            inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to("cuda")
+        # Prepare model inputs
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to("cuda")
 
-            # Generate caption
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=128,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-            )
-            generated_ids_trimmed = [
-                out_ids[len(in_ids) :]
-                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            caption = self.processor.batch_decode(
-                generated_ids_trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[0]
+        # Generate caption
+        generated_ids = self.model.generate(
+            **inputs,
+            max_new_tokens=128,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+        )
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        caption = self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
 
-            # Return formatted caption
-            return f"{prefix_text}{trigger}{caption.strip()}{suffix_text}"
-
-        except Exception as e:
-            print(f"\n⚠️ Warning: Failed to generate caption: {str(e)}")
-            return fallback_caption
+        # Return formatted caption
+        return f"{prefix_text}{trigger}{caption.strip()}{suffix_text}"
 
     def process_video_segment(
         self, 
@@ -957,11 +750,11 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
-        video_url: str = Input(
+        video_url: Optional[str] = Input(
             description="YouTube/video URL to process. Leave empty if uploading a file. Note: URL takes precedence if both URL and file are provided.",
             default=None,
         ),
-        video_file: Path = Input(
+        video_file: Optional[Path] = Input(
             description="Video file to process. Leave empty if using URL. Ignored if URL is provided.",
             default=None,
         ),
@@ -1020,7 +813,7 @@ class Predictor(BasePredictor):
             default="detailed",
             choices=["minimal", "detailed", "custom"]
         ),
-        custom_caption: str = Input(
+        custom_caption: Optional[str] = Input(
             description="Your custom caption. Required if caption_style is 'custom' or autocaption is False.",
             default=None,
         ),
@@ -1028,11 +821,11 @@ class Predictor(BasePredictor):
             description="Trigger word to include in captions (e.g., TOK, STYLE3D). Will be added at start of caption.",
             default="TOK",
         ),
-        autocaption_prefix: str = Input(
+        autocaption_prefix: Optional[str] = Input(
             description="Text to add BEFORE caption. Example: 'a video of'",
             default=None,
         ),
-        autocaption_suffix: str = Input(
+        autocaption_suffix: Optional[str] = Input(
             description="Text to add AFTER caption. Example: 'in a cinematic style'",
             default=None,
         ),
@@ -1096,11 +889,7 @@ class Predictor(BasePredictor):
         if not extracted_clips:
             return self._create_error_report("No clips were successfully extracted. Check for ffmpeg errors.")
         
-        # Handle preview_only mode
-        if preview_only:
-            return self._handle_preview_mode(extracted_clips)
-        
-        # Step 6: Add captions
+        # Step 6: Add captions (always do this regardless of preview_only)
         print(f"\n[STEP 6/6] 📝 ADDING CAPTIONS")
         
         # Determine if we should skip captions
@@ -1119,7 +908,7 @@ class Predictor(BasePredictor):
                 autocaption_suffix
             )
         
-        # Create zip file with results
+        # Create zip file (always do this, but only return it if not in preview mode)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = f"video_dataset_{timestamp}.zip"
         
@@ -1133,14 +922,27 @@ class Predictor(BasePredictor):
             caption_style
         )
         
-        print(f"\n✨ Success! Dataset created with {len(extracted_clips)} video clips")
-        print(f"Output saved to: {output_path}")
-        
-        print("\n=======================================")
-        print("🎬 VIDEO DATASET CREATOR: COMPLETE")
-        print("=======================================")
+        # Return appropriate output based on preview_only mode
+        if preview_only:
+            print("\n🎬 PREVIEW MODE ACTIVE - RETURNING EXTRACTED CLIPS")
+            print(f"\n✨ Success! Extracted {len(extracted_clips)} video clips")
+            for i, clip in enumerate(extracted_clips):
+                print(f"  Clip {i+1}: {os.path.basename(clip)}")
             
-        return [Path(output_path)]
+            # Convert clips to Path objects
+            clip_paths = [Path(clip) for clip in extracted_clips]
+            
+            print(f"To use the full dataset with captions, look in: {output_path}")
+            return clip_paths
+        else:
+            print(f"\n✨ Success! Dataset created with {len(extracted_clips)} video clips")
+            print(f"Output saved to: {output_path}")
+            
+            print("\n=======================================")
+            print("🎬 VIDEO DATASET CREATOR: COMPLETE")
+            print("=======================================")
+                
+            return [Path(output_path)]
     
     def _cleanup_workspace(self):
         """Clean up previous run files"""
@@ -1229,66 +1031,51 @@ class Predictor(BasePredictor):
         return video_path
     
     def _detect_and_filter_scenes(self, video_path, detection_mode, min_scene_length, 
-                                 max_scene_length, start_time, end_time, num_scenes):
+                                   max_scene_length, start_time, end_time, num_scenes):
         """Detect scenes and filter based on parameters"""
         print(f"\n[STEP 3/5] 🔍 DETECTING SCENES")
         print(f"Using {detection_mode.upper()} detection mode with {min_scene_length}s minimum scene length")
         
-        # Try different scene detection modes if the primary one fails
+        # Try primary detection mode first, with a fallback only if needed
         detection_modes_to_try = [detection_mode]
         if detection_mode != "content":
             detection_modes_to_try.append("content")  # Add content as fallback
-        if "threshold" not in detection_modes_to_try:
-            detection_modes_to_try.append("threshold")  # Add threshold as second fallback
-        if "adaptive" not in detection_modes_to_try:
-            detection_modes_to_try.append("adaptive")  # Add adaptive as third fallback
-            
-        scene_list = []
-        error_messages = []
         
-        # Try each detection mode with progressively lower thresholds
-        thresholds = {
-            "content": [27.0, 20.0, 15.0, 10.0],  # More sensitive thresholds
-            "threshold": [12.0, 8.0, 5.0, 3.0],
-            "adaptive": [3.0, 2.0, 1.5, 1.0]
+        scene_list = []
+        
+        # Default thresholds for each mode
+        default_thresholds = {
+            "content": 27.0,
+            "threshold": 12.0,
+            "adaptive": 3.0
         }
         
         for mode in detection_modes_to_try:
-            # Try different thresholds for each mode, from less to more sensitive
-            for threshold in thresholds.get(mode, [None]):
-                try:
-                    if mode != detection_mode or threshold != thresholds[mode][0]:
-                        print(f"\n⚠️ Trying {mode.upper()} detector with threshold={threshold}...")
-                    
-                    scene_list = self.detect_scenes(
-                        video_path,
-                        detection_mode=mode,
-                        min_scene_length=min_scene_length,
-                        threshold=threshold,
-                        start_time=start_time,
-                        end_time=end_time if end_time > 0 else 0.0
-                    )
-                    
-                    if scene_list and (num_scenes <= 0 or len(scene_list) >= num_scenes):
-                        print(f"✅ Found sufficient scenes with {mode} detector (threshold={threshold})")
-                        break  # Success with enough scenes, exit the inner loop
-                except Exception as e:
-                    error_message = str(e)
-                    error_messages.append(f"Error with {mode} detector (threshold={threshold}): {error_message}")
-                    print(f"⚠️ Scene detection failed with {mode} detector: {error_message}")
-                    scene_list = []  # Reset scene list
+            threshold = default_thresholds.get(mode)
             
-            if scene_list and (num_scenes <= 0 or len(scene_list) >= num_scenes):
-                break  # Success with enough scenes, exit the outer loop
+            try:
+                if mode != detection_mode:
+                    print(f"\n⚠️ Trying {mode.upper()} detector with threshold={threshold}...")
+                
+                scene_list = self.detect_scenes(
+                    video_path,
+                    detection_mode=mode,
+                    min_scene_length=min_scene_length,
+                    threshold=threshold,
+                    start_time=start_time,
+                    end_time=end_time if end_time > 0 else 0.0
+                )
+                
+                if scene_list and (num_scenes <= 0 or len(scene_list) >= num_scenes):
+                    print(f"✅ Found sufficient scenes with {mode} detector")
+                    break  # Success with enough scenes
+            except Exception as e:
+                print(f"⚠️ Scene detection failed with {mode} detector: {str(e)}")
+                scene_list = []  # Reset scene list
         
-        # If not enough scenes were detected, use evenly spaced scenes
-        if not scene_list or (num_scenes > 0 and len(scene_list) < num_scenes):
-            if not scene_list:
-                print("\n⚠️ All scene detection methods failed. Creating evenly spaced scenes instead.")
-            else:
-                print(f"\n⚠️ Only detected {len(scene_list)} scenes, but {num_scenes} were requested.")
-                print("Creating evenly spaced scenes to meet the requested number.")
-            
+        # Create evenly spaced scenes if detection failed
+        if not scene_list:
+            print("\n⚠️ Scene detection failed. Creating evenly spaced scenes instead.")
             scene_list = self._create_evenly_spaced_scenes(
                 video_path, 
                 min_scene_length=min_scene_length,
@@ -1297,43 +1084,25 @@ class Predictor(BasePredictor):
                 end_time=end_time,
                 num_scenes=num_scenes if num_scenes > 0 else 4  # Default to 4 scenes if not specified
             )
-            
-        # Apply max_scene_length filter, but only if it won't reduce scenes below the requested number
+        
+        # Apply max_scene_length filter
         if max_scene_length > 0 and scene_list:
             original_count = len(scene_list)
             filtered_scenes = [scene for scene in scene_list 
-                            if (scene[1].get_seconds() - scene[0].get_seconds()) <= max_scene_length]
+                              if (scene[1].get_seconds() - scene[0].get_seconds()) <= max_scene_length]
             
-            # Only apply filter if we'll still have enough scenes, or if user didn't specify num_scenes
+            # Only apply filter if we'll still have enough scenes
             if num_scenes <= 0 or len(filtered_scenes) >= num_scenes:
                 scene_list = filtered_scenes
                 print(f"📊 Filtered from {original_count} to {len(scene_list)} scenes within {max_scene_length}s max length")
-            else:
-                print(f"⚠️ Skipping max_scene_length filter to preserve the requested {num_scenes} scenes")
         
-        # If we still don't have enough scenes after all attempts, force evenly spaced scenes
-        if num_scenes > 0 and len(scene_list) < num_scenes:
-            print(f"\n⚠️ Still only have {len(scene_list)} scenes after all methods.")
-            print(f"Forcing exactly {num_scenes} evenly spaced scenes.")
-            scene_list = self._create_evenly_spaced_scenes(
-                video_path, 
-                min_scene_length=min_scene_length,
-                max_scene_length=max_scene_length,
-                start_time=start_time,
-                end_time=end_time,
-                num_scenes=num_scenes
-            )
-        
-        # Select best scenes if requested and we have more scenes than needed
-        if scene_list and num_scenes > 0 and len(scene_list) > num_scenes:
-            print(f"🔍 Selecting {num_scenes} best scenes from {len(scene_list)} detected scenes")
-            try:
+        # Select best scenes if we have more scenes than needed
+        if scene_list and num_scenes > 0:
+            if len(scene_list) > num_scenes:
+                print(f"🔍 Selecting {num_scenes} best scenes from {len(scene_list)} detected scenes")
                 scene_list = self.evaluate_scene_quality(video_path, scene_list, num_scenes)
-            except Exception as e:
-                print(f"⚠️ Error during scene quality evaluation: {str(e)}")
-                # Fallback to simple selection if quality evaluation fails
-                print(f"Using simple selection instead")
-                scene_list = scene_list[:num_scenes]
+            elif len(scene_list) < num_scenes:
+                print(f"\n⚠️ Only detected {len(scene_list)} scenes, fewer than the requested {num_scenes}.")
             
         return scene_list
     
@@ -1376,36 +1145,8 @@ class Predictor(BasePredictor):
             end_frame = int(scene_end * fps)
             
             # Create FrameTimecode objects
-            try:
-                # For newer PySceneDetect versions
-                start_tc = FrameTimecode(start_frame, fps)
-                end_tc = FrameTimecode(end_frame, fps)
-            except:
-                # For older PySceneDetect versions
-                try:
-                    start_tc = FrameTimecode(frame_num=start_frame, fps=fps)
-                    end_tc = FrameTimecode(frame_num=end_frame, fps=fps)
-                except:
-                    # Last resort: try using seconds
-                    try:
-                        start_tc = FrameTimecode(timecode=scene_start, fps=fps)
-                        end_tc = FrameTimecode(timecode=scene_end, fps=fps)
-                    except:
-                        # If all else fails, simulate the objects
-                        class FakeTimecode:
-                            def __init__(self, frame_num, seconds, fps):
-                                self.frame_num = frame_num
-                                self.seconds = seconds
-                                self.fps = fps
-                            
-                            def get_frames(self):
-                                return self.frame_num
-                                
-                            def get_seconds(self):
-                                return self.seconds
-                        
-                        start_tc = FakeTimecode(start_frame, scene_start, fps)
-                        end_tc = FakeTimecode(end_frame, scene_end, fps)
+            start_tc = FrameTimecode(start_frame, fps)
+            end_tc = FrameTimecode(end_frame, fps)
             
             scene_list.append((start_tc, end_tc))
             
@@ -1428,21 +1169,6 @@ class Predictor(BasePredictor):
             f.write(f"detection_mode: {detection_mode}\n")
         
         return [Path(error_path)]
-    
-    def _handle_preview_mode(self, extracted_clips):
-        """Return extracted clips in preview mode"""
-        print("\n🎬 PREVIEW MODE ACTIVE - RETURNING EXTRACTED CLIPS")
-        
-        print(f"\n✨ Success! Extracted {len(extracted_clips)} video clips")
-        for i, clip in enumerate(extracted_clips):
-            print(f"  Clip {i+1}: {os.path.basename(clip)}")
-        
-        # Convert all paths to Path objects - but ONLY return the MP4 clips
-        clip_paths = [Path(clip) for clip in extracted_clips]
-        
-        print(f"To create the full dataset with captions, run again without preview_only=true")
-        
-        return clip_paths
     
     def _generate_captions(self, extracted_clips, autocaption, custom_caption, 
                          caption_style, trigger_word, autocaption_prefix, autocaption_suffix):
@@ -1496,7 +1222,7 @@ class Predictor(BasePredictor):
             print(f"✅ Saved to: {txt_path}")
     
     def _create_output_zip(self, output_path, extracted_clips, skip_captions, 
-                         preview_path, video_url, video_file, caption_style):
+                           preview_path, video_url, video_file, caption_style):
         """Create ZIP file with dataset contents"""
         print(f"\n📦 Creating zip file...")
         
@@ -1504,10 +1230,7 @@ class Predictor(BasePredictor):
         default_preview_path = os.path.join(self.temp_dir, "scene_preview.jpg")
         if os.path.exists(default_preview_path):
             print(f"Removing unused preview image: {default_preview_path}")
-            try:
-                os.remove(default_preview_path)
-            except:
-                print(f"Note: Could not remove {default_preview_path}, but it will be excluded from zip")
+            os.remove(default_preview_path)
         
         with ZipFile(output_path, "w") as zipf:
             # Add video clips
