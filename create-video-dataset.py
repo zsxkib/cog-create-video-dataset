@@ -92,8 +92,8 @@ class Predictor(BasePredictor):
     def download_video(self, url: str, output_dir: str) -> str:
         """Download video from URL"""
         ydl_opts = {
-            # Get best quality available but prefer h264 codec for compatibility
-            "format": "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/best[ext=mp4]/best",
+            # Get best quality mp4 video + m4a audio, fall back to best mp4, then best overall
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             # Use MP4 container
             "merge_output_format": "mp4",
             # Keep original quality when possible
